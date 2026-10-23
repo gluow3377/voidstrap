@@ -1,0 +1,156 @@
+#!/bin/bash
+set -euo pipefail
+
+xbps-install -Suy gptfdisk xtools-minimal
+
+zgenhostid -f
+
+zpool labelclear -f /dev/nvme0n1 || true
+wipefs -a /dev/nvme0n1
+sgdisk --zap-all /dev/nvme0n1
+
+sgdisk -n 1:1m:+512m -t 1:ef00 /dev/nvme0n1
+sgdisk -n 2:0:-10m -t 2:bf00 /dev/nvme0n1
+udevadm settle
+
+read -rsp "ZFS encryption passphrase: " pass; echo
+printf '%s\n' "$pass" >/etc/zfs/zroot.key
+chmod 000 /etc/zfs/zroot.key
+unset pass
+
+zpool create -f -o ashift=12 \
+  -O compression=zstd-3 \
+  -O acltype=posixacl \
+  -O xattr=sa \
+  -O relatime=on \
+  -O encryption=aes-256-gcm \
+  -O keylocation=file:///etc/zfs/zroot.key \
+  -O keyformat=passphrase \
+  -o autotrim=on \
+  -o compatibility=openzfs-2.4-linux \
+  -m none zroot /dev/nvme0n1p2
+
+zfs create -o mountpoint=none zroot/ROOT
+zfs create -o mountpoint=/ -o canmount=noauto zroot/ROOT/void
+zfs create -o mountpoint=/home zroot/home
+
+zpool set bootfs=zroot/ROOT/void zroot
+
+zpool export zroot
+zpool import -N -R /mnt zroot
+zfs load-key -L prompt zroot
+
+zfs mount zroot/ROOT/void
+zfs mount zroot/home
+
+udevadm trigger
+
+mkdir -p /mnt/var/db/xbps/keys
+cp /var/db/xbps/keys/* /mnt/var/db/xbps/keys/
+
+XBPS_ARCH=x86_64 xbps-install \
+  -S -y -R https://repo-fi.voidlinux.org/current \
+  -r /mnt apparmor audit base-system cronie chrony curl efibootmgr elogind fish-shell git neovim NetworkManager opendoas runit-nftables socklog-void wget zramen
+
+cp /etc/hostid /mnt/etc
+mkdir /mnt/etc/zfs
+cp /etc/zfs/zroot.key /mnt/etc/zfs
+
+echo 'repository=https://repo-fi.voidlinux.org/current' >/mnt/usr/share/xbps.d/00-repository-main.conf
+echo 'repository=https://repo-fi.voidlinux.org/current/nonfree' >/mnt/usr/share/xbps.d/10-repository-nonfree.conf
+echo 'ignorepkg=sudo' >/mnt/usr/share/xbps.d/ignorepkg.conf
+
+cat << 'CHROOT' > /mnt/root/chroot
+#!/bin/bash
+set -euo pipefail
+
+xbps-remove -y sudo
+
+sed -i 's/^#HARDWARECLOCK=/HARDWARECLOCK=/' /etc/rc.conf
+sed -i 's/^#KEYMAP=.*/KEYMAP="us"/' /etc/rc.conf
+sed -i 's/^#FONT=.*/FONT="cyr-sun16"/' /etc/rc.conf
+
+ln -sf /usr/share/zoneinfo/Asia/Novokuznetsk /etc/localtime
+
+sed -i 's/^#en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/default/libc-locales
+sed -i 's/^#ru_RU.UTF-8 UTF-8/ru_RU.UTF-8 UTF-8/' /etc/default/libc-locales
+xbps-reconfigure -f glibc-locales
+sed -i 's/^LANG=.*/LANG=ru_RU.UTF-8/' /etc/locale.conf
+
+until passwd root; do :; done
+
+useradd -m -G wheel,audio,video,floppy,cdrom,optical,kvm,users,xbuilder,input -s /bin/fish gluow
+until passwd gluow; do :; done
+
+echo 'permit persist :wheel' >/etc/doas.conf
+chown -c root:root /etc/doas.conf
+chmod -c 0400 /etc/doas.conf
+
+printf '%s\n' \
+  'nofsck="yes"' \
+  'add_dracutmodules+=" zfs "' \
+  'omit_dracutmodules+=" btrfs "' \
+  'install_items+=" /etc/zfs/zroot.key "' \
+  >/etc/dracut.conf.d/zol.conf
+
+xbps-install -Suy intel-ucode zfs
+
+echo void >/etc/hostname
+
+ln -s /etc/sv/{dbus,NetworkManager,cronie,chronyd,auditd,nftables,socklog-unix,nanoklogd,zramen} /etc/runit/runsvdir/default/
+touch /var/run/elogind.pid
+
+curl -f --retry 10 --retry-delay 3 --retry-all-errors --connect-timeout 10 -o /etc/nftables.conf -L https://gitlab.archlinux.org/archlinux/packaging/packages/nftables/-/raw/main/nftables.conf
+sed -i '/tcp dport ssh/s/^/#/' /etc/nftables.conf
+sed -i '/tcp dport ssh/a\
+#    iifname "virbr0" udp dport 67 accept comment "allow dhcp from vms"\
+#    iifname "virbr0" meta l4proto { tcp, udp } th dport 53 accept comment "allow dns from vms"' /etc/nftables.conf
+sed -i '/hook forward/,/policy drop/{/policy drop/a\
+#    iifname "virbr0" accept comment "allow traffic from vms"\
+#    oifname "virbr0" ct state {established, related} accept comment "allow replies to vms"
+}' /etc/nftables.conf
+
+sed -i 's/^#export ZRAM_COMP_ALGORITHM=.*/export ZRAM_COMP_ALGORITHM=zstd/' /etc/sv/zramen/conf
+sed -i 's/^#export ZRAMEN_QUIET=.*/export ZRAMEN_QUIET=1/' /etc/sv/zramen/conf
+
+sed -i '/^if \[ -x \/sbin\/dmraid/,/^if \[ -x \/usr\/bin\/zpool/{/zpool/!s/^/#/}' /etc/runit/core-services/03-filesystems.sh
+
+zfs set org.zfsbootmenu:commandline="quiet apparmor=1 security=apparmor" zroot/ROOT
+zfs set org.zfsbootmenu:keysource="zroot/ROOT/void" zroot
+
+mkfs.vfat -F32 /dev/nvme0n1p1
+
+echo "$(blkid | grep /dev/nvme0n1p1 | cut -d ' ' -f 2) /boot/efi vfat defaults 0 0" >>/etc/fstab
+
+mkdir -p /boot/efi
+mount /boot/efi
+
+mkdir -p /boot/efi/EFI/ZBM
+cd /boot/efi/EFI/ZBM
+curl -f --retry 10 --retry-delay 3 --retry-all-errors --connect-timeout 10 -LO https://github.com/zbm-dev/zfsbootmenu/releases/download/v3.1.0/zfsbootmenu-release-x86_64-v3.1.0-linux6.18.EFI
+curl -f --retry 10 --retry-delay 3 --retry-all-errors --connect-timeout 10 -LO https://github.com/zbm-dev/zfsbootmenu/releases/download/v3.1.0/sha256.txt
+sha256sum -c --ignore-missing sha256.txt
+mv zfsbootmenu-release-x86_64-v3.1.0-linux6.18.EFI VMLINUZ.EFI
+rm sha256.txt
+
+efibootmgr -c -d /dev/nvme0n1 -p 1 \
+  -L "ZFSBootMenu" \
+  -l '\EFI\ZBM\VMLINUZ.EFI'
+
+xbps-reconfigure -fa
+
+exit
+CHROOT
+
+chmod +x /mnt/root/chroot
+xchroot /mnt /root/chroot
+
+rm /mnt/root/chroot
+rm /mnt/etc/resolv.conf
+
+zfs snapshot -r zroot@install
+
+umount -n -R /mnt
+zpool export zroot
+
+poweroff
